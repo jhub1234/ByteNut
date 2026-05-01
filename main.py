@@ -180,7 +180,7 @@ class BytenutRenewal:
             return True
         return False
 
-    # ---------- Turnstile 处理 ----------
+    # ---------- Turnstile 处理（加入滚动） ----------
     def is_turnstile_present(self, sb):
         try:
             return sb.execute_script("""
@@ -199,6 +199,14 @@ class BytenutRenewal:
         start = time.time()
         last_click = 0
         while time.time() - start < timeout:
+            # 滚动到 Turnstile 可见区域
+            try:
+                sb.execute_script("""
+                    var elem = document.querySelector('.cf-turnstile');
+                    if(elem) elem.scrollIntoView({block: 'center'});
+                """)
+            except:
+                pass
             try:
                 val = sb.execute_script(
                     """return document.querySelector("input[name='cf-turnstile-response']")?.value || "";"""
@@ -214,42 +222,77 @@ class BytenutRenewal:
                     sb.uc_gui_click_captcha()
                     last_click = now
                 except:
-                    pass
+                    # 备用方案：直接点击 .cf-turnstile 元素
+                    try:
+                        elem = sb.find_element('.cf-turnstile')
+                        elem.click()
+                        last_click = now
+                    except:
+                        pass
             time.sleep(1)
         self.log("⚠️ Turnstile 超时")
         return False
 
-    def click_extend_button(self, sb, timeout=30):
+    # ---------- 改进的续期点击与验证 ----------
+    def try_extend_and_verify(self, sb, server_id, old_expiry):
         if not self.wait_turnstile(sb):
-            return False
-        self.log("⏳ 等待 Extend 按钮...")
+            self.log("Turnstile 未通过")
+            return False, ""
+
+        self.log("⏳ 尝试点击续期按钮...")
+        button_clicked = False
         try:
-            sb.wait_for_element_clickable(EXTEND_BTN, timeout=timeout)
-            sb.click(EXTEND_BTN)
-            return True
+            if sb.is_element_visible(EXTEND_BTN):
+                sb.click(EXTEND_BTN)
+                button_clicked = True
+                self.log("已点击续期按钮")
         except:
-            if sb.is_element_present(EXTEND_BTN):
-                if sb.is_element_enabled(EXTEND_BTN):
-                    try:
-                        sb.execute_script("arguments[0].click();", sb.find_element(EXTEND_BTN))
-                        return True
-                    except:
-                        pass
-                else:
-                    self.log("⏳ 按钮禁用（冷却）")
-                    return False
-            return False
+            pass
+
+        if not button_clicked:
+            try:
+                if sb.is_element_present(EXTEND_BTN):
+                    sb.execute_script("arguments[0].click();", sb.find_element(EXTEND_BTN))
+                    button_clicked = True
+                    self.log("已通过 JS 点击续期按钮")
+            except:
+                pass
+
+        time.sleep(5)
+        for _ in range(4):
+            new_ext = self.get_extension_data(sb, server_id)
+            if new_ext:
+                new_expiry = new_ext.get("expiredTime", "")
+                if new_expiry and new_expiry != old_expiry:
+                    new_expiry_str = self.format_expiry(new_expiry)
+                    self.log(f"✅ 续期成功确认: {new_expiry_str}")
+                    return True, new_expiry_str
+            time.sleep(5)
+
+        if sb.is_element_present(EXTEND_BTN) and not sb.is_element_enabled(EXTEND_BTN):
+            self.log("⏳ 续期后按钮进入冷却")
+            new_ext = self.get_extension_data(sb, server_id)
+            if new_ext:
+                new_expiry = new_ext.get("expiredTime", "")
+                if new_expiry and new_expiry != old_expiry:
+                    new_expiry_str = self.format_expiry(new_expiry)
+                    self.log(f"✅ 冷却但续期实际成功: {new_expiry_str}")
+                    return True, new_expiry_str
+            self.log("未检测到新到期时间，判定为冷却")
+            return "cooldown", ""
+
+        self.log("⚠️ 无法确认续期结果")
+        return False, ""
 
     def format_expiry(self, dt_str):
-        """将 API 返回的时间字符串转换为统一的美观格式"""
         if not dt_str:
             return ""
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-            try:
-                dt = datetime.strptime(dt_str, fmt)
-                return dt.strftime("%b %d, %Y, %I:%M %p UTC")
-            except ValueError:
-                continue
+                try:
+                    dt = datetime.strptime(dt_str, fmt)
+                    return dt.strftime("%b %d, %Y, %I:%M %p UTC")
+                except ValueError:
+                    continue
         return dt_str
 
     def wait_until_running(self, sb, server_id, timeout=300, interval=10):
@@ -272,7 +315,6 @@ class BytenutRenewal:
                     state = srv.get("serverInfo", {}).get("state", "unknown")
         return False, state
 
-    # ---------- 等待续期生效 ----------
     def wait_until_not_expired(self, sb, server_id, timeout=120, interval=10):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -358,7 +400,8 @@ class BytenutRenewal:
                             time.sleep(5)
                             sb.click(RENEW_MENU)
                             time.sleep(3)
-                            if self.click_extend_button(sb):
+                            result, new_time = self.try_extend_and_verify(sb, server_id, expired_time)
+                            if result is True:
                                 self.log("✅ 续期成功，等待状态更新...")
                                 if not self.wait_until_not_expired(sb, server_id):
                                     self.send_tg("⚠️", "续期成功但状态未更新", user, server_id,
@@ -367,26 +410,25 @@ class BytenutRenewal:
                                                  screenshot=self.shot(sb, f"start_fail_{idx}.png"))
                                     continue
 
-                                new_ext = self.get_extension_data(sb, server_id)
-                                new_expiry = new_ext.get("expiredTime", "") if new_ext else ""
-                                new_expiry_str = self.format_expiry(new_expiry)
-
                                 if self.api_start_server(sb, server_id):
                                     is_running, final_state = self.wait_until_running(sb, server_id)
                                     if is_running:
                                         self.send_tg("✅", "续期并开机成功", user, server_id,
                                                      "offline -> running",
-                                                     f"{expiry_str} -> {new_expiry_str}",
+                                                     f"{expiry_str} -> {new_time}",
                                                      screenshot=self.shot(sb, f"ok_{idx}.png"))
                                     else:
                                         self.send_tg("⚠️", "续期成功，开机未确认", user, server_id,
                                                      f"offline -> {final_state}",
-                                                     new_expiry_str,
+                                                     new_time,
                                                      screenshot=self.shot(sb, f"start_timeout_{idx}.png"))
                                 else:
                                     self.send_tg("✅", "续期成功，开机失败", user, server_id,
-                                                 "offline", new_expiry_str,
+                                                 "offline", new_time,
                                                  screenshot=self.shot(sb, f"start_fail_{idx}.png"))
+                            elif result == "cooldown":
+                                self.send_tg("⏳", "续期后进入冷却", user, server_id, "offline", expiry_str,
+                                             screenshot=self.shot(sb, f"cooldown_{idx}.png"))
                             else:
                                 self.send_tg("❌", "续期失败", user, server_id, "offline", expiry_str,
                                              screenshot=self.shot(sb, f"extend_fail_{idx}.png"))
@@ -427,18 +469,14 @@ class BytenutRenewal:
                     time.sleep(5)
                     sb.click(RENEW_MENU)
                     time.sleep(3)
-                    if self.click_extend_button(sb):
-                        time.sleep(3)
-                        new_ext_info = self.get_extension_data(sb, server_id)
-                        if new_ext_info:
-                            new_expired = new_ext_info.get("expiredTime", "")
-                            new_expiry_str = self.format_expiry(new_expired)
-                            self.send_tg("✅", "续期成功", user, server_id, state,
-                                         f"{expiry_str} -> {new_expiry_str}",
-                                         screenshot=self.shot(sb, f"ok_{idx}.png"))
-                        else:
-                            self.send_tg("⚠️", "状态未知", user, server_id, state, expiry_str,
-                                         screenshot=self.shot(sb, f"unknown_{idx}.png"))
+                    result, new_time = self.try_extend_and_verify(sb, server_id, expired_time)
+                    if result is True:
+                        self.send_tg("✅", "续期成功", user, server_id, state,
+                                     f"{expiry_str} -> {new_time}",
+                                     screenshot=self.shot(sb, f"ok_{idx}.png"))
+                    elif result == "cooldown":
+                        self.send_tg("⏳", "续期后进入冷却", user, server_id, state, expiry_str,
+                                     screenshot=self.shot(sb, f"cooldown_{idx}.png"))
                     else:
                         self.send_tg("❌", "续期失败", user, server_id, state, expiry_str,
                                      screenshot=self.shot(sb, f"extend_fail_{idx}.png"))
